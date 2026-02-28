@@ -334,13 +334,27 @@ fn parseArgs(alloc: Allocator, argsIter: anytype) ParseError!Parsed {
 }
 
 fn defaultControlPath(alloc: Allocator, session_name: []const u8) ![]const u8 {
-    const state_dir = try xdg.state(alloc, .{ .subdir = "ghostty" });
-    defer alloc.free(state_dir);
+    // Unix domain sockets have a path length limit (108 bytes on Linux,
+    // 104 on macOS).  OpenSSH expands `%C` into a long hash, so using
+    // $XDG_STATE_HOME can easily exceed this limit.
+    //
+    // We use $XDG_RUNTIME_DIR (typically /run/user/<uid>) when available,
+    // which keeps paths short.  As a fallback we use /tmp with the UID
+    // embedded to avoid collisions.
+    const runtime_dir: []const u8 = std.posix.getenv("XDG_RUNTIME_DIR") orelse "";
+    const base_dir = if (runtime_dir.len > 0)
+        try std.fs.path.join(alloc, &.{ runtime_dir, "ghostty-ssh" })
+    else
+        try std.fmt.allocPrint(alloc, "/tmp/ghostty-ssh-{d}", .{std.os.linux.getuid()});
+    defer alloc.free(base_dir);
 
-    const filename = try std.fmt.allocPrint(alloc, "{s}-%C", .{session_name});
-    defer alloc.free(filename);
+    // Use just %C (hash of local host, remote host, port, user) as the
+    // filename — it is unique per connection and keeps paths short enough
+    // to stay within the Unix socket limit even after OpenSSH appends a
+    // temporary suffix during socket creation.
+    _ = session_name;
 
-    return try std.fs.path.join(alloc, &.{ state_dir, "ssh_mux", filename });
+    return try std.fs.path.join(alloc, &.{ base_dir, "%C" });
 }
 
 fn ensureControlPathParent(path: []const u8) !void {
