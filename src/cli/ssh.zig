@@ -5,12 +5,13 @@ const Action = @import("ghostty.zig").Action;
 const args = @import("args.zig");
 const launch_ghostty = @import("launch_ghostty.zig");
 const ssh_session = @import("ssh_session.zig");
-const internal_os = @import("../os/main.zig");
-const xdg = internal_os.xdg;
+const remote_mux = @import("remote_mux.zig");
 
 pub const Options = struct {
     class: ?[]const u8 = null,
     session: ?[]const u8 = null,
+    @"mux-session": ?[]const u8 = null,
+    @"no-mux": bool = false,
     @"control-path": ?[]const u8 = null,
     @"control-persist": ?[]const u8 = null,
     @"ssh-option": ?[]const u8 = null,
@@ -36,6 +37,8 @@ const ParseError = Allocator.Error || error{
 const Parsed = struct {
     class: ?[]const u8 = null,
     session: ?[]const u8 = null,
+    mux_session: ?[]const u8 = null,
+    no_mux: bool = false,
     control_path: ?[]const u8 = null,
     control_persist: []const u8 = "10m",
     control_persist_owned: bool = false,
@@ -47,6 +50,7 @@ const Parsed = struct {
     fn deinit(self: *Parsed, alloc: Allocator) void {
         if (self.class) |v| alloc.free(v);
         if (self.session) |v| alloc.free(v);
+        if (self.mux_session) |v| alloc.free(v);
         if (self.control_path) |v| alloc.free(v);
         if (self.target) |v| alloc.free(v);
 
@@ -64,11 +68,15 @@ const Parsed = struct {
     }
 };
 
-/// Create an SSH-backed Ghostty session with OpenSSH multiplexing enabled.
+/// Create an SSH-backed Ghostty session with a persistent remote tmux mux.
 ///
-/// This launches Ghostty with a command that uses OpenSSH `ControlMaster`
-/// multiplexing so that new tabs and windows in the same Ghostty instance reuse
-/// the same SSH transport.
+/// By default this launches Ghostty with an SSH command that bootstraps a
+/// user-scoped helper on the remote host (`~/.local/share/ghostty/remote-mux.sh`),
+/// ensures a tmux session exists, and attaches to it. The remote tmux state
+/// survives local GUI shutdown and can be reattached with `ghostty +connect`.
+///
+/// OpenSSH `ControlMaster` is still enabled so tabs/windows in the same local
+/// Ghostty instance reuse SSH transport.
 ///
 /// The created session is saved under `$XDG_STATE_HOME/ghostty/ssh_sessions` and
 /// can later be reopened with `ghostty +connect <session>`.
@@ -81,7 +89,11 @@ const Parsed = struct {
 ///
 ///   * `--class=<class>`: Custom Ghostty class/app-id for the launched session.
 ///
-///   * `--session=<name>`: Explicit session name used by `+connect`.
+///   * `--session=<name>`: Explicit local session name used by `+connect`.
+///
+///   * `--mux-session=<name>`: Remote tmux session name (default: local session name).
+///
+///   * `--no-mux`: Disable remote tmux bootstrap and use legacy direct SSH command.
 ///
 ///   * `--control-path=<path>`: Explicit OpenSSH control socket path.
 ///
@@ -151,6 +163,34 @@ fn runArgs(
         return 1;
     };
 
+    if (parsed.no_mux and parsed.mux_session != null) {
+        try stderr.print("Error: --mux-session cannot be used together with --no-mux.\n", .{});
+        return 1;
+    }
+
+    const mux_session = parsed.mux_session orelse session_name;
+    if (!parsed.no_mux and !ssh_session.isValidName(mux_session)) {
+        try stderr.print("Error: invalid mux session name: {s}\n", .{mux_session});
+        return 1;
+    }
+
+    var remote_attach: ?remote_mux.CommandArgs = null;
+    defer if (remote_attach) |*value| value.deinit(alloc);
+
+    var remote_status: ?remote_mux.CommandArgs = null;
+    defer if (remote_status) |*value| value.deinit(alloc);
+
+    const remote_attach_args: []const []const u8 = if (parsed.no_mux)
+        parsed.remote_command.items
+    else blk: {
+        remote_attach = try remote_mux.buildCommandArgs(alloc, .{
+            .operation = .attach,
+            .session = mux_session,
+            .initial_command = parsed.remote_command.items,
+        });
+        break :blk remote_attach.?.args;
+    };
+
     const command = buildCommand(
         alloc,
         target,
@@ -158,19 +198,52 @@ fn runArgs(
         parsed.control_persist,
         parsed.verbose,
         parsed.ssh_options.items,
-        parsed.remote_command.items,
+        remote_attach_args,
     ) catch |err| {
         try stderr.print("Error constructing SSH command: {}\n", .{err});
         return 1;
     };
 
+    const status_command: ?[]const u8 = if (parsed.no_mux)
+        null
+    else blk: {
+        remote_status = try remote_mux.buildCommandArgs(alloc, .{
+            .operation = .status,
+            .session = mux_session,
+        });
+
+        var probe_options: std.ArrayList([]const u8) = .empty;
+        defer probe_options.deinit(alloc);
+        try probe_options.appendSlice(alloc, parsed.ssh_options.items);
+        try probe_options.appendSlice(alloc, &.{ "BatchMode=yes", "ConnectTimeout=5" });
+
+        break :blk buildCommand(
+            alloc,
+            target,
+            control_path,
+            parsed.control_persist,
+            false,
+            probe_options.items,
+            remote_status.?.args,
+        ) catch |err| {
+            try stderr.print("Error constructing SSH status command: {}\n", .{err});
+            return 1;
+        };
+    };
+
+    const now = std.time.timestamp();
     ssh_session.save(alloc, .{
         .name = session_name,
         .command = command,
+        .status_command = status_command,
         .class = parsed.class,
         .target = target,
         .control_path = control_path,
-        .created = std.time.timestamp(),
+        .mux_backend = if (parsed.no_mux) null else remote_mux.backend_name,
+        .mux_session = if (parsed.no_mux) null else mux_session,
+        .remote_helper_version = if (parsed.no_mux) null else remote_mux.helper_version,
+        .created = now,
+        .last_seen = now,
     }) catch |err| {
         try stderr.print("Error saving SSH session metadata: {}\n", .{err});
         return 1;
@@ -189,6 +262,7 @@ fn parseArgs(alloc: Allocator, argsIter: anytype) ParseError!Parsed {
     const Pending = enum {
         class,
         session,
+        mux_session,
         control_path,
         control_persist,
         ssh_option,
@@ -208,6 +282,10 @@ fn parseArgs(alloc: Allocator, argsIter: anytype) ParseError!Parsed {
                 .session => {
                     if (parsed.session) |v| alloc.free(v);
                     parsed.session = copy;
+                },
+                .mux_session => {
+                    if (parsed.mux_session) |v| alloc.free(v);
+                    parsed.mux_session = copy;
                 },
                 .control_path => {
                     if (parsed.control_path) |v| alloc.free(v);
@@ -286,6 +364,24 @@ fn parseArgs(alloc: Allocator, argsIter: anytype) ParseError!Parsed {
 
         if (std.mem.eql(u8, arg, "--session")) {
             pending = .session;
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, arg, "--mux-session=")) {
+            const value = arg["--mux-session=".len..];
+            if (value.len == 0) return error.MissingValue;
+            if (parsed.mux_session) |v| alloc.free(v);
+            parsed.mux_session = try alloc.dupe(u8, value);
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--mux-session")) {
+            pending = .mux_session;
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--no-mux")) {
+            parsed.no_mux = true;
             continue;
         }
 
@@ -483,6 +579,8 @@ test "parse args with target only" {
     defer parsed.deinit(alloc);
 
     try testing.expectEqualStrings("user@example.com", parsed.target.?);
+    try testing.expect(!parsed.no_mux);
+    try testing.expect(parsed.mux_session == null);
     try testing.expectEqual(@as(usize, 0), parsed.ssh_options.items.len);
     try testing.expectEqual(@as(usize, 0), parsed.remote_command.items.len);
 }
@@ -510,6 +608,24 @@ test "parse args with options and remote command" {
     try testing.expectEqualStrings("attach", parsed.remote_command.items[1]);
 }
 
+test "parse args with mux options" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var iter = try std.process.ArgIteratorGeneral(.{}).init(
+        alloc,
+        "--session=prod --mux-session=remote-prod user@example.com",
+    );
+    defer iter.deinit();
+
+    var parsed = try parseArgs(alloc, &iter);
+    defer parsed.deinit(alloc);
+
+    try testing.expect(!parsed.no_mux);
+    try testing.expectEqualStrings("prod", parsed.session.?);
+    try testing.expectEqualStrings("remote-prod", parsed.mux_session.?);
+}
+
 test "build command contains multiplexing options" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -531,4 +647,31 @@ test "build command contains multiplexing options" {
     try testing.expect(std.mem.indexOf(u8, cmd, "ControlPath=/tmp/ghostty-%C") != null);
     try testing.expect(std.mem.indexOf(u8, cmd, "IdentityFile=/tmp/id") != null);
     try testing.expect(std.mem.indexOf(u8, cmd, "'hello world'") != null);
+}
+
+test "build command with remote mux bootstrap" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var remote_cmd = try remote_mux.buildCommandArgs(alloc, .{
+        .operation = .attach,
+        .session = "prod",
+        .initial_command = &.{ "nvim", "foo bar" },
+    });
+    defer remote_cmd.deinit(alloc);
+
+    const cmd = try buildCommand(
+        alloc,
+        "user@example.com",
+        "/tmp/ghostty-%C",
+        "10m",
+        false,
+        &.{},
+        remote_cmd.args,
+    );
+    defer alloc.free(cmd);
+
+    try testing.expect(std.mem.indexOf(u8, cmd, "remote-mux.sh") != null);
+    try testing.expect(std.mem.indexOf(u8, cmd, "attach") != null);
+    try testing.expect(std.mem.indexOf(u8, cmd, "foo bar") != null);
 }
