@@ -55,9 +55,21 @@ pub fn defaultName(alloc: Allocator, target: []const u8) ![]const u8 {
             continue;
         }
 
-        if (c == '_' or c == '.' or c == '-') {
+        if (c == '_' or c == '-') {
             try buf.append(alloc, c);
             last_dash = false;
+            continue;
+        }
+
+        // Dots are replaced with hyphens because tmux uses dots as
+        // window/pane separators in target specifications (session:window.pane).
+        // A session name containing dots would confuse tmux target matching
+        // even with the exact-match prefix (e.g. `-t "=name.with.dots"`).
+        if (c == '.') {
+            if (!last_dash) {
+                try buf.append(alloc, '-');
+                last_dash = true;
+            }
             continue;
         }
 
@@ -325,7 +337,19 @@ test "defaultName normalizes target" {
     const name = try defaultName(alloc, "User@Example.com:2200");
     defer alloc.free(name);
 
-    try testing.expectEqualStrings("user-example.com-2200", name);
+    // Dots are replaced with hyphens because tmux uses dots as
+    // window/pane separators in target specifications.
+    try testing.expectEqualStrings("user-example-com-2200", name);
+}
+
+test "defaultName replaces dots for tmux compatibility" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const name = try defaultName(alloc, "user@10.10.10.110");
+    defer alloc.free(name);
+
+    try testing.expectEqualStrings("user-10-10-10-110", name);
 }
 
 test "save and load" {

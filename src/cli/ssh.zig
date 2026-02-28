@@ -197,6 +197,7 @@ fn runArgs(
         control_path,
         parsed.control_persist,
         parsed.verbose,
+        remote_attach_args.len > 0,
         parsed.ssh_options.items,
         remote_attach_args,
     ) catch |err| {
@@ -222,6 +223,7 @@ fn runArgs(
             target,
             control_path,
             parsed.control_persist,
+            false,
             false,
             probe_options.items,
             remote_status.?.args,
@@ -468,6 +470,7 @@ fn buildCommand(
     control_path: []const u8,
     control_persist: []const u8,
     verbose: bool,
+    force_tty: bool,
     ssh_options: []const []const u8,
     remote_command: []const []const u8,
 ) ![]const u8 {
@@ -481,6 +484,11 @@ fn buildCommand(
     }
 
     try argv.append(alloc, "ssh");
+
+    // Force PTY allocation on the remote side when running interactive
+    // commands (e.g. tmux attach). SSH does not allocate a PTY when a
+    // remote command is specified, even if stdin is a terminal.
+    if (force_tty) try argv.append(alloc, "-t");
 
     try argv.append(alloc, "-o");
     try argv.append(alloc, "ControlMaster=auto");
@@ -503,7 +511,25 @@ fn buildCommand(
     }
 
     try argv.append(alloc, target);
-    try argv.appendSlice(alloc, remote_command);
+
+    // Remote command arguments must be shell-escaped for the *remote* shell,
+    // then joined into a single string. SSH concatenates remote command
+    // arguments with spaces before passing them to the remote user's login
+    // shell (which might be fish, zsh, bash, etc.), stripping any quoting
+    // that was only present on the local side. By pre-joining with proper
+    // shell quoting, we ensure the remote shell receives a correctly-quoted
+    // command regardless of what shell it is.
+    if (remote_command.len > 0) {
+        var remote_buf: std.ArrayList(u8) = .empty;
+        defer remote_buf.deinit(alloc);
+        for (remote_command, 0..) |arg, i| {
+            if (i > 0) try remote_buf.append(alloc, ' ');
+            try appendShellEscaped(alloc, &remote_buf, arg);
+        }
+        const remote_joined = try remote_buf.toOwnedSlice(alloc);
+        try owned.append(alloc, remote_joined);
+        try argv.append(alloc, remote_joined);
+    }
 
     return buildShellCommand(alloc, argv.items);
 }
@@ -636,12 +662,14 @@ test "build command contains multiplexing options" {
         "/tmp/ghostty-%C",
         "15m",
         false,
+        true,
         &.{"IdentityFile=/tmp/id"},
         &.{ "printf", "hello world" },
     );
     defer alloc.free(cmd);
 
     try testing.expect(std.mem.startsWith(u8, cmd, "shell:ssh "));
+    try testing.expect(std.mem.indexOf(u8, cmd, "-t ") != null);
     try testing.expect(std.mem.indexOf(u8, cmd, "ControlMaster=auto") != null);
     try testing.expect(std.mem.indexOf(u8, cmd, "ControlPersist=15m") != null);
     try testing.expect(std.mem.indexOf(u8, cmd, "ControlPath=/tmp/ghostty-%C") != null);
@@ -666,11 +694,13 @@ test "build command with remote mux bootstrap" {
         "/tmp/ghostty-%C",
         "10m",
         false,
+        true,
         &.{},
         remote_cmd.args,
     );
     defer alloc.free(cmd);
 
+    try testing.expect(std.mem.indexOf(u8, cmd, "-t ") != null);
     try testing.expect(std.mem.indexOf(u8, cmd, "remote-mux.sh") != null);
     try testing.expect(std.mem.indexOf(u8, cmd, "attach") != null);
     try testing.expect(std.mem.indexOf(u8, cmd, "foo bar") != null);
